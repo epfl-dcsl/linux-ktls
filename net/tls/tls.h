@@ -132,6 +132,12 @@ struct tls_rec {
 	u8 aead_req_ctx[];
 };
 
+struct tls_decrypt_arg {
+	struct_group(inargs, bool zc; bool async; bool async_done; u8 tail;);
+
+	struct sk_buff *skb;
+};
+
 int __net_init tls_proc_init(struct net *net);
 void __net_exit tls_proc_fini(struct net *net);
 
@@ -166,6 +172,8 @@ ssize_t tls_sw_splice_read(struct socket *sock, loff_t *ppos,
 			   size_t len, unsigned int flags);
 int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
 		     sk_read_actor_t read_actor);
+int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
+		   struct scatterlist *out_sg, struct tls_decrypt_arg *darg);
 
 int tls_device_sendmsg(struct sock *sk, struct msghdr *msg, size_t size);
 void tls_device_splice_eof(struct socket *sock);

@@ -459,6 +459,9 @@ static void tls_strp_load_anchor_with_queue(struct tls_strparser *strp, int len)
 	u32 offset;
 
 	first = tcp_recv_skb(strp->sk, tp->copied_seq, &offset);
+
+	printk("offset: %d\n", offset);
+
 	if (WARN_ON_ONCE(!first))
 		return;
 
@@ -497,18 +500,63 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 	tlm->control	= strp->mark;
 }
 
+#ifdef CONFIG_SKB_DECRYPTED
+static int tls_strp_attempt_decryption(struct tls_strparser *strp)
+{
+	struct sk_buff *inq_skb = strp->anchor;
+	struct tls_decrypt_arg dargs = {
+		.zc = false,
+		.async = false,
+		.skb = inq_skb,
+	};
+	char header[1];
+	int err;
+
+	if ((err = skb_copy_bits(inq_skb, strp->stm.offset, header, 1))) {
+		return err;
+	}
+
+	if (header[0] != TLS_RECORD_TYPE_DATA || skb_is_decrypted(inq_skb) ||
+	    WARN_ON(inq_skb->len < strp->stm.full_len)) {
+		return 0;
+	}
+
+	tls_strp_msg_load(strp, true);
+	printk("yayyyyyyyyyyyyyyyyyyyyyyyyy :3\n");
+
+	// return tls_decrypt_sg(strp->sk, NULL, NULL, &dargs);
+	printk("attempting decryption for record of size %u\n", inq_skb->len);
+
+	if ((err = tls_decrypt_sg(strp->sk, NULL, NULL, &dargs))) {
+		return err;
+	}
+
+	inq_skb->decrypted = 1;
+
+	return 0;
+}
+#else
+static int tls_strp_attempt_decryption(struct tls_strparser *strp,
+				       struct sk_buff *inq_skb)
+{
+	return 0;
+}
+#endif
+
 /* Called with lock held on lower socket */
 static int tls_strp_read_sock(struct tls_strparser *strp)
 {
-	int sz, inq;
+	int sz, inq, err;
 
 	inq = tcp_inq(strp->sk);
 	if (inq < 1)
 		return 0;
 
+	// Already in copy mode
 	if (unlikely(strp->copy_mode))
 		return tls_strp_read_copyin(strp);
 
+	// Frame is not contained within the incoming SKB
 	if (inq < strp->stm.full_len)
 		return tls_strp_read_copy(strp, true);
 
@@ -529,6 +577,10 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 
 	if (!tls_strp_check_queue_ok(strp))
 		return tls_strp_read_copy(strp, false);
+
+	if ((err = tls_strp_attempt_decryption(strp))) {
+		return err;
+	}
 
 	WRITE_ONCE(strp->msg_ready, 1);
 	tls_rx_msg_ready(strp);
