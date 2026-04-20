@@ -1750,9 +1750,36 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 			     struct tls_decrypt_arg *darg)
 {
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
+	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
 	struct strp_msg *rxm;
 	int err;
+
+	/*
+	 * ZC early-decrypt path: tls_strp_decrypt_inline() already decrypted
+	 * this record and stashed the clear-text skb here.  Consume it
+	 * directly, skipping all decrypt machinery.
+	 *
+	 * The record sequence number was already advanced by
+	 * tls_strp_decrypt_inline(), so we must NOT advance it again.
+	 *
+	 * TODO (copy path): a parallel ctx->strp.decrypted_skb_copy pointer
+	 * will be checked here once the copy-path early-decrypt is wired up.
+	 */
+	if (ctx->strp.decrypted_skb) {
+		darg->skb   = ctx->strp.decrypted_skb;
+		darg->zc    = true;
+		darg->async = false;
+		ctx->strp.decrypted_skb = NULL;
+
+		/* Adjust offsets: strip the prepend (header + explicit IV) */
+		rxm = strp_msg(darg->skb);
+		rxm->offset   += prot->prepend_size;
+		rxm->full_len -= prot->overhead_size;
+
+		printk("Reading from decrypted skb");
+		return tls_check_pending_rekey(sk, tls_ctx, darg->skb);
+	}
 
 	// Attempts DEVICE decryption and fall back to SW decryption if unavailable/failed.
 	err = tls_decrypt_device(sk, msg, tls_ctx, darg);
@@ -2374,90 +2401,6 @@ read_sock_requeue:
 	goto read_sock_end;
 }
 
-static int tls_sw_read_sock2(struct sock *sk)
-{
-	struct tls_context *tls_ctx = tls_get_ctx(sk);
-	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
-	struct tls_prot_info *prot = &tls_ctx->prot_info;
-	struct strp_msg *rxm = NULL;
-	struct sk_buff *skb = NULL;
-	struct sk_psock *psock;
-	size_t flushed_at = 0;
-	bool released = true;
-	struct tls_msg *tlm;
-	ssize_t copied = 0;
-	ssize_t decrypted;
-	int err, has_decrypted = 0, skb_count = 0;
-
-	printk("[TSRS2#%d] Calling readsock2\n", count);
-
-	psock = sk_psock_get(sk);
-	if (psock) {
-		printk("no psock\n");
-		sk_psock_put(sk, psock);
-		return -EINVAL;
-	}
-	err = tls_rx_reader_acquire(sk, ctx, true);
-	if (err < 0) {
-		printk("[TSRS2#%d] Unable to aquire reader lock\n", count);
-		return err;
-	}
-
-	/* If crypto failed the connection is broken */
-	err = ctx->async_wait.err;
-	if (err) {
-		printk("[TSRS2#%d] Crypto failed\n", count);
-		goto read_sock_end;
-	}
-
-	decrypted = 0;
-	do {
-		struct tls_decrypt_arg darg;
-
-		err = tls_rx_rec_wait(sk, NULL, true, released);
-		if (err <= 0) {
-			printk("[TSRS2#%d] Unable to get frame\n", count);
-			goto read_sock_end;
-		}
-
-		memset(&darg.inargs, 0, sizeof(darg.inargs));
-
-		err = tls_rx_one_record(sk, NULL, &darg);
-		if (err < 0) {
-			printk("[TSRS2#%d] Unable to decrypt\n", count);
-			tls_err_abort(sk, -EBADMSG);
-			goto read_sock_end;
-		}
-
-		skb_count++;
-		released = tls_read_flush_backlog(sk, prot, INT_MAX, 0,
-						  decrypted, &flushed_at);
-		skb = darg.skb;
-		rxm = strp_msg(skb);
-		tlm = tls_msg(skb);
-		decrypted += rxm->full_len;
-		has_decrypted = 1;
-
-		tls_rx_rec_done(ctx);
-
-		if (skb) {
-			printk("[TSRS2#%d] Pushing at the end of rx\n", count);
-			__skb_queue_tail(&ctx->rx_list, skb);
-		}
-	} while (skb);
-
-read_sock_end:
-	if (has_decrypted && ctx->saved_data_ready) {
-		printk("[TSRS2#%d] Calling saved_data_ready! (%d skbs)\n",
-		       count, skb_count);
-		ctx->saved_data_ready(sk);
-	}
-
-	printk("[TSRS2#%d] Done!\n", count);
-	tls_rx_reader_release(sk, ctx);
-	return copied ?: err;
-}
-
 bool tls_sw_sock_is_readable(struct sock *sk)
 {
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
@@ -2916,8 +2859,9 @@ int tls_set_sw_offload(struct sock *sk, int tx,
 
 		tls_update_rx_zc_capable(ctx);
 		sw_ctx_rx->async_capable =
-			src_crypto_info->version != TLS_1_3_VERSION &&
-			!!(tfm->__crt_alg->cra_flags & CRYPTO_ALG_ASYNC);
+			false;
+			// TODO src_crypto_info->version != TLS_1_3_VERSION &&
+			// !!(tfm->__crt_alg->cra_flags & CRYPTO_ALG_ASYNC);
 
 		rc = tls_strp_init(&sw_ctx_rx->strp, sk);
 		if (rc)
@@ -2954,4 +2898,113 @@ free_priv:
 	}
 out:
 	return rc;
+}
+
+/* tls_sw.c – add after tls_rx_msg_ready() */
+
+/**
+ * tls_strp_decrypt_inline - attempt synchronous in-place decryption in the
+ *                            ZC (non-copy) strparser path.
+ * @strp: the per-socket TLS stream parser
+ *
+ * Called from tls_strp_read_sock() after the full TLS record has been
+ * located in the TCP receive queue but BEFORE msg_ready is set.  The
+ * anchor SKB's frag_list points directly into sk_receive_queue, so no
+ * intermediate copy buffer exists – this is the zero-copy pre-condition.
+ *
+ * We set up a tls_decrypt_arg with zc=true and async=false and invoke
+ * tls_decrypt_sg() directly.  If decryption succeeds the record's pages
+ * are already plaintext when tls_sw_recvmsg() wakes up; it will detect
+ * the pre-decrypted state and skip the decrypt step.
+ *
+ * Contract with tls_sw_recvmsg() / tls_rx_one_record():
+ *   - We store the resulting clear-text skb in strp->decrypted_skb.
+ *   - tls_rx_one_record() checks strp->decrypted_skb first; if non-NULL
+ *     it skips tls_decrypt_sw/device and uses that skb directly.
+ *   - On any error we leave strp->decrypted_skb = NULL so the existing
+ *     decrypt-on-read path takes over transparently.
+ *
+ * This function must be called with the socket lock held (same requirement
+ * as the rest of tls_strp_read_sock).
+ */
+int tls_strp_decrypt_inline(struct tls_strparser *strp)
+{
+	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
+	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+	struct tls_prot_info *prot = &tls_ctx->prot_info;
+	struct tls_decrypt_arg darg = {
+		.zc    = true,
+		.async = false,
+	};
+	struct tls_msg *tlm;
+	struct strp_msg *rxm;
+	int pad, err;
+
+	/*
+	 * Only handle the SW path here.  HW-offloaded sockets are
+	 * decrypted by the NIC; tls_decrypt_device() will deal with
+	 * them in tls_rx_one_record() as usual.
+	 */
+	if (tls_ctx->rx_conf != TLS_SW)
+		return 0;
+
+	/*
+	 * Async-capable contexts do their own completion dance in
+	 * tls_sw_recvmsg().  Don't shortcut them here.
+	 */
+	if (ctx->async_capable)
+		return 0;
+
+	/*
+	 * Load anchor so that strp_msg(anchor) reflects the current record
+	 * length/offset before we pass it to tls_decrypt_sg.
+	 */
+	tls_strp_msg_load(strp, false);
+
+	tlm = tls_msg(tls_strp_msg(ctx));
+	if(tlm->control != TLS_RECORD_TYPE_DATA) {
+		return 0;
+	}
+
+	/*
+	 * tls_decrypt_sg() expects to find the ciphertext via
+	 * tls_strp_msg(ctx), which returns ctx->strp.anchor.
+	 * out_iov=NULL + out_sg=NULL forces in-place (ZC) decryption:
+	 * darg.zc will be cleared by tls_decrypt_sg if the conditions
+	 * aren't met, and we check it afterwards.
+	 */
+	err = tls_decrypt_sg(strp->sk, NULL, NULL, &darg);
+	if (err < 0) {
+		/*
+		 * Not fatal – fall back to decrypt-on-read.  Clear any
+		 * partially-set state so tls_rx_one_record() starts fresh.
+		 */
+		if (err == -EBADMSG)
+			TLS_INC_STATS(sock_net(strp->sk),
+				      LINUX_MIB_TLSDECRYPTERROR);
+		return 0;
+	}
+
+	/* Trim padding (TLS 1.3) */
+	pad = tls_padding_length(prot, darg.skb, &darg);
+	if (pad < 0) {
+		consume_skb(darg.skb);
+		return 0;
+	}
+
+	rxm = strp_msg(darg.skb);
+	rxm->full_len -= pad;
+
+	/* Advance the RX record sequence number now, exactly as
+	 * tls_rx_one_record() would do after a successful decrypt. */
+	tls_advance_record_sn(strp->sk, prot, &tls_ctx->rx);
+
+	/*
+	 * Hand the decrypted skb to the context so tls_rx_one_record()
+	 * can consume it without re-decrypting.
+	 */
+	WARN_ON_ONCE(ctx->strp.decrypted_skb);
+	ctx->strp.decrypted_skb = darg.skb;
+
+	return 0;
 }

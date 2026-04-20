@@ -500,53 +500,10 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 	tlm->control	= strp->mark;
 }
 
-#ifdef CONFIG_SKB_DECRYPTED
-static int tls_strp_attempt_decryption(struct tls_strparser *strp)
-{
-	struct sk_buff *inq_skb = strp->anchor;
-	struct tls_decrypt_arg dargs = {
-		.zc = false,
-		.async = false,
-		.skb = inq_skb,
-	};
-	char header[1];
-	int err;
-
-	if ((err = skb_copy_bits(inq_skb, strp->stm.offset, header, 1))) {
-		return err;
-	}
-
-	if (header[0] != TLS_RECORD_TYPE_DATA || skb_is_decrypted(inq_skb) ||
-	    WARN_ON(inq_skb->len < strp->stm.full_len)) {
-		return 0;
-	}
-
-	tls_strp_msg_load(strp, true);
-	printk("yayyyyyyyyyyyyyyyyyyyyyyyyy :3\n");
-
-	// return tls_decrypt_sg(strp->sk, NULL, NULL, &dargs);
-	printk("attempting decryption for record of size %u\n", inq_skb->len);
-
-	if ((err = tls_decrypt_sg(strp->sk, NULL, NULL, &dargs))) {
-		return err;
-	}
-
-	inq_skb->decrypted = 1;
-
-	return 0;
-}
-#else
-static int tls_strp_attempt_decryption(struct tls_strparser *strp,
-				       struct sk_buff *inq_skb)
-{
-	return 0;
-}
-#endif
-
 /* Called with lock held on lower socket */
 static int tls_strp_read_sock(struct tls_strparser *strp)
 {
-	int sz, inq, err;
+	int sz, inq;
 
 	inq = tcp_inq(strp->sk);
 	if (inq < 1)
@@ -578,9 +535,26 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	if (!tls_strp_check_queue_ok(strp))
 		return tls_strp_read_copy(strp, false);
 
-	if ((err = tls_strp_attempt_decryption(strp))) {
-		return err;
-	}
+	/*
+	 * ZC path: the anchor's frag_list references sk_receive_queue
+	 * pages directly – no copy has occurred.  Attempt to decrypt
+	 * the record in-place right now, before waking the reader.
+	 *
+	 * On success the record is already decrypted when tls_sw_recvmsg()
+	 * picks it up; tls_rx_one_record() will see it pre-decrypted via
+	 * tls_decrypt_device() returning > 0 (TLS_HW) or the sw path will
+	 * find ctx->zc_capable and the skb already clear.
+	 *
+	 * On failure (ENOMEM, async in-progress, …) we fall through to the
+	 * normal msg_ready wake-up and let tls_sw_recvmsg() handle it as
+	 * before – this is always safe because tls_strp_decrypt_inline() is
+	 * a no-op if it cannot proceed synchronously.
+	 *
+	 * TODO (copy path): call tls_strp_decrypt_copy() here once
+	 * tls_strp_read_copy() / tls_strp_read_copyin() have finished
+	 * building the copied skb and before they set msg_ready.
+	 */
+	tls_strp_decrypt_inline(strp);
 
 	WRITE_ONCE(strp->msg_ready, 1);
 	tls_rx_msg_ready(strp);

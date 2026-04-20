@@ -174,6 +174,7 @@ int tls_sw_read_sock(struct sock *sk, read_descriptor_t *desc,
 		     sk_read_actor_t read_actor);
 int tls_decrypt_sg(struct sock *sk, struct iov_iter *out_iov,
 		   struct scatterlist *out_sg, struct tls_decrypt_arg *darg);
+int tls_strp_decrypt_inline(struct tls_strparser *strp);
 
 int tls_device_sendmsg(struct sock *sk, struct msghdr *msg, size_t size);
 void tls_device_splice_eof(struct socket *sock);
