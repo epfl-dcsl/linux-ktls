@@ -554,9 +554,9 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	 * tls_strp_read_copy() / tls_strp_read_copyin() have finished
 	 * building the copied skb and before they set msg_ready.
 	 */
+
 	tls_strp_decrypt_inline(strp);
 
-	WRITE_ONCE(strp->msg_ready, 1);
 	tls_rx_msg_ready(strp);
 
 	return 0;

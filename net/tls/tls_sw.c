@@ -1776,6 +1776,7 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 		rxm = strp_msg(darg->skb);
 		rxm->offset   += prot->prepend_size;
 		rxm->full_len -= prot->overhead_size;
+		tls_advance_record_sn(sk, prot, &tls_ctx->rx);
 
 		printk("Reading from decrypted skb");
 		return tls_check_pending_rekey(sk, tls_ctx, darg->skb);
@@ -2932,39 +2933,26 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
-	struct tls_decrypt_arg darg = {
-		.zc    = true,
-		.async = false,
-	};
+	struct strp_msg *rxm = NULL;
+	struct sk_buff *skb = NULL;
+	bool released = true;
 	struct tls_msg *tlm;
-	struct strp_msg *rxm;
-	int pad, err;
+	ssize_t copied = 0;
+	int err, pad;
+	struct tls_decrypt_arg darg;
 
-	/*
-	 * Only handle the SW path here.  HW-offloaded sockets are
-	 * decrypted by the NIC; tls_decrypt_device() will deal with
-	 * them in tls_rx_one_record() as usual.
-	 */
-	if (tls_ctx->rx_conf != TLS_SW)
-		return 0;
+	printk("[TSRS2#%d] Calling readsock2\n", count);
 
-	/*
-	 * Async-capable contexts do their own completion dance in
-	 * tls_sw_recvmsg().  Don't shortcut them here.
-	 */
-	if (ctx->async_capable)
-		return 0;
-
-	/*
-	 * Load anchor so that strp_msg(anchor) reflects the current record
-	 * length/offset before we pass it to tls_decrypt_sg.
-	 */
-	tls_strp_msg_load(strp, false);
-
-	tlm = tls_msg(tls_strp_msg(ctx));
-	if(tlm->control != TLS_RECORD_TYPE_DATA) {
-		return 0;
+	/* If crypto failed the connection is broken */
+	err = ctx->async_wait.err;
+	if (err) {
+		// printk("[TSRS2#%d] Crypto failed\n", count);
+		goto read_sock_end;
 	}
+
+	tls_strp_msg_load(&ctx->strp, released);
+
+	memset(&darg.inargs, 0, sizeof(darg.inargs));
 
 	/*
 	 * tls_decrypt_sg() expects to find the ciphertext via
@@ -2980,10 +2968,13 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 		 * partially-set state so tls_rx_one_record() starts fresh.
 		 */
 		if (err == -EBADMSG)
-			TLS_INC_STATS(sock_net(strp->sk),
-				      LINUX_MIB_TLSDECRYPTERROR);
+			TLS_INC_STATS(sock_net(strp->sk), LINUX_MIB_TLSDECRYPTERROR);
 		return 0;
 	}
+
+	skb = darg.skb;
+	rxm = strp_msg(skb);
+	tlm = tls_msg(skb);
 
 	/* Trim padding (TLS 1.3) */
 	pad = tls_padding_length(prot, darg.skb, &darg);
@@ -2992,19 +2983,21 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 		return 0;
 	}
 
-	rxm = strp_msg(darg.skb);
 	rxm->full_len -= pad;
-
-	/* Advance the RX record sequence number now, exactly as
-	 * tls_rx_one_record() would do after a successful decrypt. */
+	rxm->offset += prot->prepend_size;
+	rxm->full_len -= prot->overhead_size;
 	tls_advance_record_sn(strp->sk, prot, &tls_ctx->rx);
 
-	/*
-	 * Hand the decrypted skb to the context so tls_rx_one_record()
-	 * can consume it without re-decrypting.
-	 */
-	WARN_ON_ONCE(ctx->strp.decrypted_skb);
-	ctx->strp.decrypted_skb = darg.skb;
+	tcp_read_done(ctx->strp.sk, ctx->strp.stm.full_len);
 
-	return 0;
+	memset(&ctx->strp.stm, 0, sizeof(ctx->strp.stm));
+
+	if (skb) {
+		// printk("[TSRS2#%d] Pushing at the end of rx\n", count);
+		__skb_queue_tail(&ctx->rx_list, skb);
+	}
+
+read_sock_end:
+	// printk("[TSRS2#%d] Done!\n", count);
+	return copied ?: err;
 }
