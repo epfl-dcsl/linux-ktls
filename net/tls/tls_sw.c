@@ -48,7 +48,6 @@
 
 #include "tls.h"
 
-static int tls_sw_read_sock2(struct sock *sk);
 static int count = 0;
 
 struct tls_decrypt_ctx {

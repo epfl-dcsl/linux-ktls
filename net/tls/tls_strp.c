@@ -503,6 +503,7 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 /* Called with lock held on lower socket */
 static int tls_strp_read_sock(struct tls_strparser *strp)
 {
+	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
 	int sz, inq;
 
 	inq = tcp_inq(strp->sk);
@@ -555,7 +556,12 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	 * building the copied skb and before they set msg_ready.
 	 */
 
-	tls_strp_decrypt_inline(strp);
+	printk("decrypt_bh: %d\n", tls_ctx->decrypt_bh);
+	if (tls_ctx->decrypt_bh) {
+		tls_strp_decrypt_inline(strp);
+	} else {
+		WRITE_ONCE(strp->msg_ready, 1);
+	}
 
 	tls_rx_msg_ready(strp);
 

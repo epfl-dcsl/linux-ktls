@@ -516,6 +516,26 @@ static int do_tls_getsockopt_tx_zc(struct sock *sk, char __user *optval,
 	return 0;
 }
 
+static int do_tls_getsockopt_bh_decrypt(struct sock *sk, char __user *optval,
+				   int __user *optlen)
+{
+	struct tls_context *ctx = tls_get_ctx(sk);
+	unsigned int value;
+	int len;
+
+	if (get_user(len, optlen))
+		return -EFAULT;
+
+	if (len != sizeof(value))
+		return -EINVAL;
+
+	value = ctx->decrypt_bh;
+	if (copy_to_user(optval, &value, sizeof(value)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static int do_tls_getsockopt_no_pad(struct sock *sk, char __user *optval,
 				    int __user *optlen)
 {
@@ -562,6 +582,9 @@ static int do_tls_getsockopt(struct sock *sk, int optname,
 		break;
 	case TLS_RX_EXPECT_NO_PAD:
 		rc = do_tls_getsockopt_no_pad(sk, optval, optlen);
+		break;
+	case TLS_RX_BH_DECRYPT:
+		rc = do_tls_getsockopt_bh_decrypt(sk, optval, optlen);
 		break;
 	default:
 		rc = -ENOPROTOOPT;
@@ -780,6 +803,25 @@ static int do_tls_setsockopt_tx_zc(struct sock *sk, sockptr_t optval,
 	return 0;
 }
 
+static int do_tls_setsockopt_decrypt_bh(struct sock *sk, sockptr_t optval,
+				    unsigned int optlen) {
+	struct tls_context *ctx = tls_get_ctx(sk);
+	unsigned int value;
+
+	if (sockptr_is_null(optval) || optlen != sizeof(value))
+		return -EINVAL;
+
+	if (copy_from_sockptr(&value, optval, sizeof(value)))
+		return -EFAULT;
+
+	if (value > 1)
+		return -EINVAL;
+
+	ctx->decrypt_bh = value;
+
+	return 0;
+}
+
 static int do_tls_setsockopt_no_pad(struct sock *sk, sockptr_t optval,
 				    unsigned int optlen)
 {
@@ -832,6 +874,9 @@ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
 		break;
 	case TLS_RX_EXPECT_NO_PAD:
 		rc = do_tls_setsockopt_no_pad(sk, optval, optlen);
+		break;
+	case TLS_RX_BH_DECRYPT:
+		rc = do_tls_setsockopt_decrypt_bh(sk, optval, optlen);
 		break;
 	default:
 		rc = -ENOPROTOOPT;
