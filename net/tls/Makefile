@@ -4,7 +4,7 @@
 #
 
 CFLAGS_trace.o := -I$(src)
-CFLAGS += -O0
+CFLAGS += -O3
 
 obj-$(CONFIG_TLS) += tls.o
 

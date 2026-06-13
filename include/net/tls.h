@@ -120,14 +120,6 @@ struct tls_strparser {
 
 	struct sk_buff *anchor;
 	struct work_struct work;
-
-	/* Pre-decrypted skb produced by tls_strp_decrypt_inline() in the
-     * ZC path.  NULL in all other cases.
-     * Protected by the socket lock (same as the rest of the strparser).
-     *
-     * TODO (copy path): add decrypted_skb_copy for the copy path here.
-     */
-    struct sk_buff *decrypted_skb;
 };
 
 struct tls_sw_context_rx {
