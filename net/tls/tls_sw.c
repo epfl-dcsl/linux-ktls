@@ -1801,7 +1801,7 @@ static int tls_record_content_type(struct msghdr *msg, struct tls_msg *tlm,
 
 static void tls_rx_rec_done(struct tls_sw_context_rx *ctx)
 {
-	tls_strp_msg_done(&ctx->strp, true);
+	tls_strp_msg_done(&ctx->strp);
 }
 
 /* This function traverses the rx_list in tls receive context to copies the
@@ -2019,6 +2019,22 @@ int tls_sw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	err = ctx->async_wait.err;
 	if (err)
 		goto end;
+
+	/* Process pending decrypted records. It must be non-zero-copy */
+	err = process_rx_list(ctx, msg, &control, 0, len, is_peek, &rx_more);
+	if (err < 0)
+		goto end;
+
+	copied = err;
+	if (len <= copied || (copied && control != TLS_RECORD_TYPE_DATA) || rx_more)
+		goto end;
+
+	if(ctx->strp.decrypted_anchor) {
+		__skb_queue_tail(&ctx->rx_list, ctx->strp.decrypted_anchor);
+		ctx->strp.decrypted_anchor = NULL;
+
+		tls_strp_msg_done(&ctx->strp);
+	}
 
 	/* Process pending decrypted records. It must be non-zero-copy */
 	err = process_rx_list(ctx, msg, &control, 0, len, is_peek, &rx_more);
@@ -2913,6 +2929,8 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 	int err, pad;
 	struct tls_decrypt_arg darg;
 
+	WARN_ON(strp->decrypted_anchor != NULL);
+
 	// printk("[TSRS2#%d] Calling readsock2\n", count);
 
 	/* If crypto failed the connection is broken */
@@ -2967,11 +2985,9 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 	rxm->full_len -= prot->overhead_size;
 	tls_advance_record_sn(strp->sk, prot, &tls_ctx->rx);
 
-	// printk("[TSRS2#%d] Pushing at the end of rx\n", count);
-	__skb_queue_tail(&ctx->rx_list, skb);
+	strp->decrypted_anchor = skb;
 
 decrypt_inline_end:
-	tls_strp_msg_done(&ctx->strp, false);
 	// printk("[TSRS2#%d] Done!\n", count);
 	return copied ?: err;
 }

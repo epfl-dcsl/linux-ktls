@@ -506,61 +506,68 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
 	int sz, inq;
 
-	while (likely(!strp->stopped) && !strp->msg_ready &&
-	       (inq = tcp_inq(strp->sk)) > 0) {
-		// Already in copy mode
-		if (unlikely(strp->copy_mode))
-			return tls_strp_read_copyin(strp);
-
-		// Frame is not contained within the incoming SKB
-		if (inq < strp->stm.full_len)
-			return tls_strp_read_copy(strp, true);
-
-		if (!strp->stm.full_len) {
-			tls_strp_load_anchor_with_queue(strp, inq);
-
-			sz = tls_rx_msg_size(strp, strp->anchor);
-			if (sz < 0) {
-				tls_strp_abort_strp(strp, sz);
-				return sz;
-			}
-
-			strp->stm.full_len = sz;
-
-			if (!strp->stm.full_len || inq < strp->stm.full_len)
-				return tls_strp_read_copy(strp, true);
-		}
-
-		if (!tls_strp_check_queue_ok(strp))
-			return tls_strp_read_copy(strp, false);
-
-		/*
-		* ZC path: the anchor's frag_list references sk_receive_queue
-		* pages directly – no copy has occurred.  Attempt to decrypt
-		* the record in-place right now, before waking the reader.
-		*
-		* On success the record is already decrypted when tls_sw_recvmsg()
-		* picks it up; tls_rx_one_record() will see it pre-decrypted via
-		* tls_decrypt_device() returning > 0 (TLS_HW) or the sw path will
-		* find ctx->zc_capable and the skb already clear.
-		*
-		* On failure (ENOMEM, async in-progress, …) we fall through to the
-		* normal msg_ready wake-up and let tls_sw_recvmsg() handle it as
-		* before – this is always safe because tls_strp_decrypt_inline() is
-		* a no-op if it cannot proceed synchronously.
-		*
-		* TODO (copy path): call tls_strp_decrypt_copy() here once
-		* tls_strp_read_copy() / tls_strp_read_copyin() have finished
-		* building the copied skb and before they set msg_ready.
-		*/
-
-		// printk("decrypt_bh: %d\n", tls_ctx->decrypt_bh);
-		if (tls_ctx->decrypt_bh) {
-			tls_strp_decrypt_inline(strp);
-		} else {
-			WRITE_ONCE(strp->msg_ready, 1);
-		}
+	if (strp->msg_ready) {
+		goto decrypt_bh;
 	}
+
+	inq = tcp_inq(strp->sk);
+	if (inq < 1) {
+		return 0;
+	}
+
+	// Already in copy mode
+	if (unlikely(strp->copy_mode))
+		return tls_strp_read_copyin(strp);
+
+	// Frame is not contained within the incoming SKB
+	if (inq < strp->stm.full_len)
+		return tls_strp_read_copy(strp, true);
+
+	if (!strp->stm.full_len) {
+		tls_strp_load_anchor_with_queue(strp, inq);
+
+		sz = tls_rx_msg_size(strp, strp->anchor);
+		if (sz < 0) {
+			tls_strp_abort_strp(strp, sz);
+			return sz;
+		}
+
+		strp->stm.full_len = sz;
+
+		if (!strp->stm.full_len || inq < strp->stm.full_len)
+			return tls_strp_read_copy(strp, true);
+	}
+
+	if (!tls_strp_check_queue_ok(strp))
+		return tls_strp_read_copy(strp, false);
+
+	/*
+	* ZC path: the anchor's frag_list references sk_receive_queue
+	* pages directly – no copy has occurred.  Attempt to decrypt
+	* the record in-place right now, before waking the reader.
+	*
+	* On success the record is already decrypted when tls_sw_recvmsg()
+	* picks it up; tls_rx_one_record() will see it pre-decrypted via
+	* tls_decrypt_device() returning > 0 (TLS_HW) or the sw path will
+	* find ctx->zc_capable and the skb already clear.
+	*
+	* On failure (ENOMEM, async in-progress, …) we fall through to the
+	* normal msg_ready wake-up and let tls_sw_recvmsg() handle it as
+	* before – this is always safe because tls_strp_decrypt_inline() is
+	* a no-op if it cannot proceed synchronously.
+	*
+	* TODO (copy path): call tls_strp_decrypt_copy() here once
+	* tls_strp_read_copy() / tls_strp_read_copyin() have finished
+	* building the copied skb and before they set msg_ready.
+	*/
+
+	// printk("decrypt_bh: %d\n", tls_ctx->decrypt_bh);
+	if (tls_ctx->decrypt_bh) {
+decrypt_bh:
+		tls_strp_decrypt_inline(strp);
+	}
+
+	WRITE_ONCE(strp->msg_ready, 1);
 
 	tls_rx_msg_ready(strp);
 
@@ -604,7 +611,7 @@ static void tls_strp_work(struct work_struct *w)
 	release_sock(strp->sk);
 }
 
-void tls_strp_msg_done(struct tls_strparser *strp, bool check_rcv)
+void tls_strp_msg_done(struct tls_strparser *strp)
 {
 	WARN_ON(!strp->stm.full_len);
 
@@ -616,8 +623,7 @@ void tls_strp_msg_done(struct tls_strparser *strp, bool check_rcv)
 	WRITE_ONCE(strp->msg_ready, 0);
 	memset(&strp->stm, 0, sizeof(strp->stm));
 
-	if(check_rcv)
-		tls_strp_check_rcv(strp);
+	tls_strp_check_rcv(strp);
 }
 
 void tls_strp_stop(struct tls_strparser *strp)

@@ -119,6 +119,7 @@ struct tls_strparser {
 	struct strp_msg stm;
 
 	struct sk_buff *anchor;
+	struct sk_buff *decrypted_anchor;
 	struct work_struct work;
 };
 
