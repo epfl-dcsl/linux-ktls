@@ -108,6 +108,8 @@ struct tls_sw_context_tx {
 
 struct tls_strparser {
 	struct sock *sk;
+	size_t tcp_offset;
+	size_t decrypted_tcp_seq;
 
 	u32 mark : 8;
 	u32 stopped : 1;
@@ -119,7 +121,7 @@ struct tls_strparser {
 	struct strp_msg stm;
 
 	struct sk_buff *anchor;
-	struct sk_buff *decrypted_anchor;
+	struct sk_buff_head decrypted;
 	struct work_struct work;
 };
 

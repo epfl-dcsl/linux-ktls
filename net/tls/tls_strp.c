@@ -13,6 +13,9 @@
 
 static struct workqueue_struct *tls_strp_wq;
 
+static int BH_DECRYPTED = 0;
+static int SW_DECRYPTED = 0;
+
 static void tls_strp_abort_strp(struct tls_strparser *strp, int err)
 {
 	if (strp->stopped)
@@ -452,18 +455,35 @@ static bool tls_strp_check_queue_ok(struct tls_strparser *strp)
 	return true;
 }
 
-static void tls_strp_load_anchor_with_queue(struct tls_strparser *strp, int len)
+static int tls_strp_load_anchor_with_queue(struct tls_strparser *strp, int len)
 {
 	struct tcp_sock *tp = tcp_sk(strp->sk);
 	struct sk_buff *first;
-	u32 offset;
+	u32 offset, skip;
 
 	first = tcp_recv_skb(strp->sk, tp->copied_seq, &offset);
+    if (WARN_ON_ONCE(!first))
+        return -ENOMSG;
 
-	// printk("offset: %d\n", offset);
+    skip = strp->tcp_offset;
+    while (skip > 0) {
+        u32 avail = first->len - offset;
 
-	if (WARN_ON_ONCE(!first))
-		return;
+        if (skip < avail) {
+            /* target is within this SKB */
+            offset += skip;
+            skip = 0;
+        } else {
+            /* move to next SKB */
+            skip -= avail;
+            offset = 0;
+            first = first->next;
+            if (WARN_ON_ONCE(!first ||
+                first == (struct sk_buff *)&strp->sk->sk_receive_queue))
+                return -ENOMSG;
+        }
+    }
+
 
 	/* Bestow the state onto the anchor */
 	strp->anchor->len = offset + len;
@@ -476,6 +496,8 @@ static void tls_strp_load_anchor_with_queue(struct tls_strparser *strp, int len)
 	strp->anchor->destructor = NULL;
 
 	strp->stm.offset = offset;
+
+	return 0;
 }
 
 void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
@@ -487,7 +509,7 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 	DEBUG_NET_WARN_ON_ONCE(!strp->stm.full_len);
 
 	if (!strp->copy_mode && force_refresh) {
-		if (WARN_ON(tcp_inq(strp->sk) < strp->stm.full_len))
+		if (WARN_ON(tcp_inq(strp->sk) < strp->stm.full_len+strp->tcp_offset))
 			return;
 
 		tls_strp_load_anchor_with_queue(strp, strp->stm.full_len);
@@ -504,13 +526,13 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 static int tls_strp_read_sock(struct tls_strparser *strp)
 {
 	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
-	int sz, inq;
+	int sz, inq, err;
 
 	if (strp->msg_ready) {
 		goto decrypt_bh;
 	}
 
-	inq = tcp_inq(strp->sk);
+	inq = tcp_inq(strp->sk) - strp->tcp_offset;
 	if (inq < 1) {
 		return 0;
 	}
@@ -524,7 +546,9 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 		return tls_strp_read_copy(strp, true);
 
 	if (!strp->stm.full_len) {
-		tls_strp_load_anchor_with_queue(strp, inq);
+		if ((err = tls_strp_load_anchor_with_queue(strp, inq))) {
+			return err;
+		}
 
 		sz = tls_rx_msg_size(strp, strp->anchor);
 		if (sz < 0) {
@@ -564,10 +588,18 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	// printk("decrypt_bh: %d\n", tls_ctx->decrypt_bh);
 	if (tls_ctx->decrypt_bh) {
 decrypt_bh:
-		tls_strp_decrypt_inline(strp);
+		if (unlikely(strp->copy_mode) ||
+		    (err = tls_strp_decrypt_inline(strp)) < 0) {
+			tls_ctx->decrypt_bh = 0;
+			SW_DECRYPTED++;
+			WRITE_ONCE(strp->msg_ready, 1);
+		} else {
+			BH_DECRYPTED++;
+		}
+	} else {
+		SW_DECRYPTED++;
+		WRITE_ONCE(strp->msg_ready, 1);
 	}
-
-	WRITE_ONCE(strp->msg_ready, 1);
 
 	tls_rx_msg_ready(strp);
 
@@ -628,6 +660,8 @@ void tls_strp_msg_done(struct tls_strparser *strp)
 
 void tls_strp_stop(struct tls_strparser *strp)
 {
+	printk("BH_DECRYPTED: %d\n", BH_DECRYPTED);
+	printk("SW_DECRYPTED: %d\n", SW_DECRYPTED);
 	strp->stopped = 1;
 }
 
@@ -641,6 +675,8 @@ int tls_strp_init(struct tls_strparser *strp, struct sock *sk)
 	if (!strp->anchor)
 		return -ENOMEM;
 
+	skb_queue_head_init(&strp->decrypted);
+	
 	INIT_WORK(&strp->work, tls_strp_work);
 
 	return 0;
