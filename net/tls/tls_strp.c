@@ -13,9 +13,6 @@
 
 static struct workqueue_struct *tls_strp_wq;
 
-static int BH_DECRYPTED = 0;
-static int SW_DECRYPTED = 0;
-
 static void tls_strp_abort_strp(struct tls_strparser *strp, int err)
 {
 	if (strp->stopped)
@@ -137,6 +134,7 @@ int tls_strp_msg_cow(struct tls_sw_context_rx *ctx)
 
 	tcp_read_done(strp->sk, strp->stm.full_len);
 	strp->copy_mode = 1;
+	tls_get_ctx(strp->sk)->decrypt_bh = 0;
 
 	return 0;
 }
@@ -417,6 +415,7 @@ static int tls_strp_read_copy(struct tls_strparser *strp, bool qshort)
 	shinfo->frag_list = NULL;
 
 	strp->copy_mode = 1;
+	tls_get_ctx(strp->sk)->decrypt_bh = 0;
 	strp->stm.offset = 0;
 
 	strp->anchor->len = 0;
@@ -526,24 +525,29 @@ void tls_strp_msg_load(struct tls_strparser *strp, bool force_refresh)
 static int tls_strp_read_sock(struct tls_strparser *strp)
 {
 	struct tls_context *tls_ctx = tls_get_ctx(strp->sk);
-	int sz, inq, err;
+	int sz, inq, err, did_work = 0;
 
-	if (strp->msg_ready) {
+	if (strp->msg_ready && tls_ctx->decrypt_bh) {
 		goto decrypt_bh;
 	}
 
+restart:
 	inq = tcp_inq(strp->sk) - strp->tcp_offset;
 	if (inq < 1) {
-		return 0;
+		goto end;
 	}
 
 	// Already in copy mode
-	if (unlikely(strp->copy_mode))
+	if (unlikely(strp->copy_mode)) {
 		return tls_strp_read_copyin(strp);
+	}
 
 	// Frame is not contained within the incoming SKB
-	if (inq < strp->stm.full_len)
+	if (inq < strp->stm.full_len) {
+		if (strp->tcp_offset)
+			goto end;
 		return tls_strp_read_copy(strp, true);
+	}
 
 	if (!strp->stm.full_len) {
 		if ((err = tls_strp_load_anchor_with_queue(strp, inq))) {
@@ -558,12 +562,18 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 
 		strp->stm.full_len = sz;
 
-		if (!strp->stm.full_len || inq < strp->stm.full_len)
+		if (!strp->stm.full_len || inq < strp->stm.full_len) {
+			if (strp->tcp_offset)
+				goto end;
 			return tls_strp_read_copy(strp, true);
+		}
 	}
 
-	if (!tls_strp_check_queue_ok(strp))
+	if (!tls_strp_check_queue_ok(strp)) {
+		if (strp->tcp_offset)
+			goto end;
 		return tls_strp_read_copy(strp, false);
+	}
 
 	/*
 	* ZC path: the anchor's frag_list references sk_receive_queue
@@ -585,23 +595,23 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
 	* building the copied skb and before they set msg_ready.
 	*/
 
-	// printk("decrypt_bh: %d\n", tls_ctx->decrypt_bh);
+	did_work=1;
 	if (tls_ctx->decrypt_bh) {
 decrypt_bh:
-		if (unlikely(strp->copy_mode) ||
-		    (err = tls_strp_decrypt_inline(strp)) < 0) {
+		if ((err = tls_strp_decrypt_inline(strp)) < 0) {
 			tls_ctx->decrypt_bh = 0;
-			SW_DECRYPTED++;
-			WRITE_ONCE(strp->msg_ready, 1);
+			goto sw_decrypted;
 		} else {
-			BH_DECRYPTED++;
+			goto restart;
 		}
 	} else {
-		SW_DECRYPTED++;
+sw_decrypted:
 		WRITE_ONCE(strp->msg_ready, 1);
 	}
 
-	tls_rx_msg_ready(strp);
+end:
+	if ((strp->msg_ready || !skb_queue_empty(&strp->decrypted)))
+		tls_rx_msg_ready(strp);
 
 	return 0;
 }
@@ -660,8 +670,8 @@ void tls_strp_msg_done(struct tls_strparser *strp)
 
 void tls_strp_stop(struct tls_strparser *strp)
 {
-	printk("BH_DECRYPTED: %d\n", BH_DECRYPTED);
-	printk("SW_DECRYPTED: %d\n", SW_DECRYPTED);
+	// printk("BH_DECRYPTED=%d,SW_DECRYPTED=%d,CP_DECRYPTED=%d\n",
+	//        BH_DECRYPTED, SW_DECRYPTED, CP_DECRYPTED);
 	strp->stopped = 1;
 }
 

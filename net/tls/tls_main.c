@@ -424,7 +424,6 @@ static __poll_t tls_sk_poll(struct file *file, struct socket *sock,
 	psock = sk_psock_get(sk);
 
 	if ((skb_queue_empty_lockless(&ctx->rx_list) &&
-	     skb_queue_empty_lockless(&ctx->strp.decrypted) &&
 	     !tls_strp_msg_ready(ctx) && sk_psock_queue_empty(psock)) ||
 	    READ_ONCE(ctx->key_update_pending))
 		mask &= ~(EPOLLIN | EPOLLRDNORM);
@@ -516,7 +515,7 @@ static int do_tls_getsockopt_tx_zc(struct sock *sk, char __user *optval,
 	return 0;
 }
 
-static int do_tls_getsockopt_bh_decrypt(struct sock *sk, char __user *optval,
+static int do_tls_getsockopt_decrypt_bh(struct sock *sk, char __user *optval,
 				   int __user *optlen)
 {
 	struct tls_context *ctx = tls_get_ctx(sk);
@@ -584,7 +583,7 @@ static int do_tls_getsockopt(struct sock *sk, int optname,
 		rc = do_tls_getsockopt_no_pad(sk, optval, optlen);
 		break;
 	case TLS_RX_BH_DECRYPT:
-		rc = do_tls_getsockopt_bh_decrypt(sk, optval, optlen);
+		rc = do_tls_getsockopt_decrypt_bh(sk, optval, optlen);
 		break;
 	default:
 		rc = -ENOPROTOOPT;
@@ -805,7 +804,7 @@ static int do_tls_setsockopt_tx_zc(struct sock *sk, sockptr_t optval,
 
 static int do_tls_setsockopt_decrypt_bh(struct sock *sk, sockptr_t optval,
 				    unsigned int optlen) {
-	struct tls_context *ctx = tls_get_ctx(sk);
+	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	unsigned int value;
 
 	if (sockptr_is_null(optval) || optlen != sizeof(value))
@@ -817,7 +816,7 @@ static int do_tls_setsockopt_decrypt_bh(struct sock *sk, sockptr_t optval,
 	if (value > 1)
 		return -EINVAL;
 
-	ctx->decrypt_bh = value;
+	tls_ctx->decrypt_bh = value;
 
 	return 0;
 }

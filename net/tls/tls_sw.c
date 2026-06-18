@@ -1317,7 +1317,7 @@ tls_rx_rec_wait(struct sock *sk, struct sk_psock *psock, bool nonblock,
 
 	timeo = sock_rcvtimeo(sk, nonblock);
 
-	while (!tls_strp_msg_ready(ctx) ) {
+	while (!tls_strp_msg_ready(ctx)) {
 		if (!sk_psock_queue_empty(psock))
 			return 0;
 
@@ -1347,7 +1347,7 @@ tls_rx_rec_wait(struct sock *sk, struct sk_psock *psock, bool nonblock,
 		sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
 		ret = sk_wait_event(sk, &timeo,
 				    tls_strp_msg_ready(ctx) ||
-				    !sk_psock_queue_empty(psock),
+					    !sk_psock_queue_empty(psock),
 				    &wait);
 		sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
 		remove_wait_queue(sk_sleep(sk), &wait);
@@ -1357,7 +1357,8 @@ tls_rx_rec_wait(struct sock *sk, struct sk_psock *psock, bool nonblock,
 			return sock_intr_errno(timeo);
 	}
 
-	tls_strp_msg_load(&ctx->strp, released);
+	if (!tls_ctx->decrypt_bh)
+		tls_strp_msg_load(&ctx->strp, released);
 
 	return 1;
 }
@@ -1761,7 +1762,6 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
 
 	// Attempts DEVICE decryption and fall back to SW decryption if unavailable/failed.
 	err = tls_decrypt_device(sk, msg, tls_ctx, darg);
-	// printk("Device decrypt completed with %d\n", err);
 	if (!err)
 		err = tls_decrypt_sw(sk, tls_ctx, msg, darg);
 	if (err < 0)
@@ -1847,9 +1847,6 @@ static int process_rx_list(struct tls_sw_context_rx *ctx,
 		struct sk_buff *next_skb;
 		struct strp_msg *rxm = strp_msg(skb);
 		int chunk = min_t(unsigned int, rxm->full_len - skip, len);
-
-		// if (chunk>0)
-			// printk("reading %d bytes from rx_list\n", chunk);
 
 		tlm = tls_msg(skb);
 
@@ -1986,8 +1983,6 @@ static void tls_rx_reader_unlock(struct sock *sk, struct tls_sw_context_rx *ctx)
 int tls_sw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		   int *addr_len)
 {
-	// printk("[RECV] try to recv\n");
-
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct tls_prot_info *prot = &tls_ctx->prot_info;
@@ -2010,13 +2005,11 @@ int tls_sw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	bool zc_capable;
 
 	if (unlikely(flags & MSG_ERRQUEUE)) {
-		// printk("[RECV] ERRQUEUE");
 		return sock_recv_errqueue(sk, msg, len, SOL_IP, IP_RECVERR);
 	}
 
 	err = tls_rx_reader_lock(sk, ctx, flags & MSG_DONTWAIT);
 	if (err < 0) {
-		// printk("[RECV] cannot aquire reader lock");
 		return err;
 	}
 	psock = sk_psock_get(sk);
@@ -2027,51 +2020,44 @@ int tls_sw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	if (err)
 		goto end;
 
-	/* Process pending decrypted records. It must be non-zero-copy */
-	err = process_rx_list(ctx, msg, &control, 0, len, is_peek, &rx_more);
-	if (err < 0)
-		goto end;
-
-	copied = err;
-	if (len <= copied || (copied && control != TLS_RECORD_TYPE_DATA) || rx_more)
-		goto end;
-
-	while ((decrypted_buff = __skb_dequeue(&ctx->strp.decrypted))) {
-		__skb_queue_tail(&ctx->rx_list, decrypted_buff);
-
-		struct skb_decrypted_cb *cb = (void *)&decrypted_buff->cb;
-		tcp_read_done(sk, cb->read_size);
-		printk("offset before decr	: %zu\n", ctx->strp.tcp_offset);
-		ctx->strp.tcp_offset -= cb->read_size;
-		printk("offset after decr: %zu\n", ctx->strp.tcp_offset);
-
-		/* Process pending decrypted records. It must be non-zero-copy */
-		err = process_rx_list(ctx, msg, &control, 0, len, is_peek,
-				      &rx_more);
-		if (err < 0)
-			goto end;
-
-		if (len <= copied ||
-		    (copied && control != TLS_RECORD_TYPE_DATA) || rx_more)
-			goto end;
-	}
-
-	// printk("starting decryption in recvmsg\n");
 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
-	len = len - copied;
 
 	zc_capable = !bpf_strp_enabled && !is_kvec && !is_peek &&
 		ctx->zc_capable;
 	decrypted = 0;
 	while (len && (decrypted + copied < target || tls_strp_msg_ready(ctx))) {
-		// printk("recv decryption loop\n");
-		struct tls_decrypt_arg darg;
+				struct tls_decrypt_arg darg;
 		int to_decrypt, chunk;
+
+		/* Process pending decrypted records. It must be non-zero-copy */
+		err = process_rx_list(ctx, msg, &control, 0, len, is_peek, &rx_more);
+		if (err < 0)
+			goto end;
+
+		copied += err;
+		if (len <= copied || (copied && control != TLS_RECORD_TYPE_DATA) || rx_more)
+			goto end;
 
 		err = tls_rx_rec_wait(sk, psock, flags & MSG_DONTWAIT,
 				      released);
-		// printk("wait done! (queue is %d, err is %d)\n",
-		    //    skb_queue_empty(&ctx->strp.decrypted), err);
+
+		if((decrypted_buff = __skb_dequeue(&ctx->strp.decrypted))) {
+			__skb_queue_tail(&ctx->rx_list, decrypted_buff);
+
+			struct skb_decrypted_cb *cb =
+				(void *)&decrypted_buff->cb;
+			tcp_read_done(sk, cb->read_size);
+			ctx->strp.tcp_offset -= cb->read_size;
+
+			continue;
+		}
+
+		if (tls_ctx->decrypt_bh) {
+			if (err <= 0)
+				goto end;
+			continue;
+		}
+
 		if (err <= 0) {
 			if (psock) {
 				chunk = sk_msg_recvmsg(sk, psock, msg, len,
@@ -2084,8 +2070,6 @@ int tls_sw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 			}
 			goto recv_end;
 		}
-
-		printk("SW decryption");
 
 		memset(&darg.inargs, 0, sizeof(darg.inargs));
 
@@ -2231,7 +2215,6 @@ recv_end:
 	copied += decrypted;
 
 end:
-	// printk("[RECV] done %zd!", copied ? : err);
 	tls_rx_reader_unlock(sk, ctx);
 	if (psock)
 		sk_psock_put(sk, psock);
@@ -2419,8 +2402,7 @@ bool tls_sw_sock_is_readable(struct sock *sk)
 	rcu_read_unlock();
 
 	return !ingress_empty || tls_strp_msg_ready(ctx) ||
-	       !skb_queue_empty(&ctx->rx_list) ||
-	       !skb_queue_empty(&ctx->strp.decrypted);
+	       !skb_queue_empty(&ctx->rx_list);
 }
 
 int tls_rx_msg_size(struct tls_strparser *strp, struct sk_buff *skb)
@@ -2493,8 +2475,6 @@ void tls_rx_msg_ready(struct tls_strparser *strp)
 
 static void tls_data_ready(struct sock *sk)
 {
-	// printk("[TRD#%d] Data ready!\n", count);
-
 	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
 	struct sk_psock *psock;
@@ -2511,13 +2491,10 @@ static void tls_data_ready(struct sock *sk)
 	psock = sk_psock_get(sk);
 	if (psock) {
 		if (!list_empty(&psock->ingress_msg)) {
-			// printk("[TRD#%d] Calling saved_ready!\n", count);
-			ctx->saved_data_ready(sk);
+						ctx->saved_data_ready(sk);
 		}
 		sk_psock_put(sk, psock);
 	}
-
-	// printk("[TRD#%d] Done!\n", count++);
 }
 
 void tls_sw_cancel_work_tx(struct tls_context *tls_ctx)
@@ -2584,7 +2561,6 @@ void tls_sw_release_resources_rx(struct sock *sk)
 		 */
 		if (ctx->saved_data_ready) {
 			write_lock_bh(&sk->sk_callback_lock);
-			// printk("[TSRRR#%d] Calling saved_data_ready!\n", count);
 			sk->sk_data_ready = ctx->saved_data_ready;
 			write_unlock_bh(&sk->sk_callback_lock);
 		}
@@ -2765,7 +2741,6 @@ static void tls_finish_key_update(struct sock *sk, struct tls_context *tls_ctx)
 
 	WRITE_ONCE(ctx->key_update_pending, false);
 	/* wake-up pre-existing poll() */
-	// printk("[TFKU#%d] Calling saved_data_ready!\n", count);
 	ctx->saved_data_ready(sk);
 }
 
@@ -2945,18 +2920,14 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 	struct tls_decrypt_arg darg;
 
 	WARN_ON(strp->copy_mode);
-
-	// printk("[TSRS2#%d] Calling readsock2\n", count);
-
+	
 	/* If crypto failed the connection is broken */
 	err = ctx->async_wait.err;
 	if (err) {
-		// printk("[TSRS2#%d] Crypto failed\n", count);
 		goto decrypt_inline_end;
 	}
 
 	if (unlikely(ctx->key_update_pending)) {
-		printk("exiting early (key)\n");
 		return -EKEYEXPIRED;
 	}
 
@@ -2979,7 +2950,6 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 		 */
 		if (err == -EBADMSG)
 			TLS_INC_STATS(sock_net(strp->sk), LINUX_MIB_TLSDECRYPTERROR);
-		printk("exiting early (decrypt): %d\n", err);
 		goto decrypt_inline_end;
 	}
 
@@ -2991,34 +2961,26 @@ int tls_strp_decrypt_inline(struct tls_strparser *strp)
 	pad = tls_padding_length(prot, darg.skb, &darg);
 	if (pad < 0) {
 		consume_skb(darg.skb);
-		printk("exiting early (padding)\n");
 		goto decrypt_inline_end;
 	}
 
-	rxm->full_len -= pad;
+	rxm->full_len -= (pad + prot->overhead_size);
 	rxm->offset += prot->prepend_size;
-	rxm->full_len -= prot->overhead_size;
 	tls_advance_record_sn(strp->sk, prot, &tls_ctx->rx);
 
 	struct sk_skb_cb *cb = (void *)&darg.skb->cb;
 	struct skb_decrypted_cb *dcb = (void *)&cb->data;
 	dcb->read_size = strp->stm.full_len;
 
-	printk("offset before incr: %zu\n", strp->tcp_offset);
 	strp->tcp_offset += strp->stm.full_len;
-	printk("offset after incr: %zu\n", strp->tcp_offset);
 
 	tls_msg(darg.skb)->control = tlm->control;
 
 	__skb_queue_tail(&strp->decrypted, darg.skb);
 
-	// static int count = 0;
-	// printk("Added SKB to strp->decrypted (%d, %d)\n", count++, tlm->control);
-
 	WRITE_ONCE(strp->msg_ready, 0);
 	memset(&strp->stm, 0, sizeof(strp->stm));
 
 decrypt_inline_end:
-	// printk("[TSRS2#%d] Done!\n", count);
-	return copied ?: err;
+		return copied ?: err;
 }

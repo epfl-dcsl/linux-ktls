@@ -225,7 +225,8 @@ static inline struct sk_buff *tls_strp_msg(struct tls_sw_context_rx *ctx)
 
 static inline bool tls_strp_msg_ready(struct tls_sw_context_rx *ctx)
 {
-	return READ_ONCE(ctx->strp.msg_ready);
+	return READ_ONCE(ctx->strp.msg_ready) ||
+	       !skb_queue_empty_lockless(&ctx->strp.decrypted);
 }
 
 static inline bool tls_strp_msg_mixed_decrypted(struct tls_sw_context_rx *ctx)
